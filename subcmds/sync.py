@@ -21,6 +21,7 @@ import multiprocessing
 import netrc
 import optparse
 import os
+from pathlib import Path
 import sys
 import tempfile
 import time
@@ -82,14 +83,52 @@ from wrapper import Wrapper
 
 _ONE_DAY_S = 24 * 60 * 60
 
-# Env var to implicitly turn auto-gc back on.  This was added to allow a user to
-# revert a change in default behavior in v2.29.9.  Remove after 2023-04-01.
-_REPO_AUTO_GC = "REPO_AUTO_GC"
-_AUTO_GC = os.environ.get(_REPO_AUTO_GC) == "1"
-
 _REPO_ALLOW_SHALLOW = os.environ.get("REPO_ALLOW_SHALLOW")
 
 logger = RepoLogger(__file__)
+
+
+def _SafeCheckoutOrder(checkouts: List[Project]) -> List[List[Project]]:
+    """Generate a sequence of checkouts that is safe to perform. The client
+    should checkout everything from n-th index before moving to n+1.
+
+    This is only useful if manifest contains nested projects.
+
+    E.g. if foo, foo/bar and foo/bar/baz are project paths, then foo needs to
+    finish before foo/bar can proceed, and foo/bar needs to finish before
+    foo/bar/baz."""
+    res = [[]]
+    current = res[0]
+
+    # depth_stack contains a current stack of parent paths.
+    depth_stack = []
+    # Checkouts are iterated in the hierarchical order. That way, it can easily
+    # be determined if the previous checkout is parent of the current checkout.
+    # We are splitting by the path separator so the final result is
+    # hierarchical, and not just lexicographical. For example, if the projects
+    # are: foo, foo/bar, foo-bar, lexicographical order produces foo, foo-bar
+    # and foo/bar, which doesn't work.
+    for checkout in sorted(checkouts, key=lambda x: x.relpath.split("/")):
+        checkout_path = Path(checkout.relpath)
+        while depth_stack:
+            try:
+                checkout_path.relative_to(depth_stack[-1])
+            except ValueError:
+                # Path.relative_to returns ValueError if paths are not relative.
+                # TODO(sokcevic): Switch to is_relative_to once min supported
+                # version is py3.9.
+                depth_stack.pop()
+            else:
+                if len(depth_stack) >= len(res):
+                    # Another depth created.
+                    res.append([])
+                break
+
+        current = res[len(depth_stack)]
+        current.append(checkout)
+        depth_stack.append(checkout_path)
+
+    return res
 
 
 class _FetchOneResult(NamedTuple):
@@ -243,6 +282,11 @@ directories if they have previously been linked to a different
 object directory. WARNING: This may cause data to be lost since
 refs may be removed when overwriting.
 
+The --force-checkout option can be used to force git to switch revs even if the
+index or the working tree differs from HEAD, and if there are untracked files.
+WARNING: This may cause data to be lost since uncommitted changes may be
+removed.
+
 The --force-remove-dirty option can be used to remove previously used
 projects with uncommitted changes. WARNING: This may cause data to be
 lost since uncommitted changes may be removed with projects that no longer
@@ -339,6 +383,14 @@ later is required to fix a server side protocol bug.
             help="overwrite an existing git directory if it needs to "
             "point to a different object directory. WARNING: this "
             "may cause loss of data",
+        )
+        p.add_option(
+            "--force-checkout",
+            dest="force_checkout",
+            action="store_true",
+            help="force checkout even if it results in throwing away "
+            "uncommitted modifications. "
+            "WARNING: this may cause loss of data",
         )
         p.add_option(
             "--force-remove-dirty",
@@ -956,12 +1008,17 @@ later is required to fix a server side protocol bug.
 
         return _FetchMainResult(all_projects)
 
-    def _CheckoutOne(self, detach_head, force_sync, verbose, project):
+    def _CheckoutOne(
+        self, detach_head, force_sync, force_checkout, verbose, project
+    ):
         """Checkout work tree for one project
 
         Args:
             detach_head: Whether to leave a detached HEAD.
-            force_sync: Force checking out of the repo.
+            force_sync: Force checking out of .git directory (e.g. overwrite
+            existing git directory that was previously linked to a different
+            object directory).
+            force_checkout: Force checking out of the repo content.
             verbose: Whether to show verbose messages.
             project: Project object for the project to checkout.
 
@@ -976,7 +1033,11 @@ later is required to fix a server side protocol bug.
         errors = []
         try:
             project.Sync_LocalHalf(
-                syncbuf, force_sync=force_sync, errors=errors, verbose=verbose
+                syncbuf,
+                force_sync=force_sync,
+                force_checkout=force_checkout,
+                errors=errors,
+                verbose=verbose,
             )
             success = syncbuf.Finish()
         except GitError as e:
@@ -1040,15 +1101,22 @@ later is required to fix a server side protocol bug.
                 pm.update(msg=project.name)
             return ret
 
-        proc_res = self.ExecuteInParallel(
-            opt.jobs_checkout,
-            functools.partial(
-                self._CheckoutOne, opt.detach_head, opt.force_sync, opt.verbose
-            ),
-            all_projects,
-            callback=_ProcessResults,
-            output=Progress("Checking out", len(all_projects), quiet=opt.quiet),
-        )
+        for projects in _SafeCheckoutOrder(all_projects):
+            proc_res = self.ExecuteInParallel(
+                opt.jobs_checkout,
+                functools.partial(
+                    self._CheckoutOne,
+                    opt.detach_head,
+                    opt.force_sync,
+                    opt.force_checkout,
+                    opt.verbose,
+                ),
+                projects,
+                callback=_ProcessResults,
+                output=Progress(
+                    "Checking out", len(all_projects), quiet=opt.quiet
+                ),
+            )
 
         self._local_sync_state.Save()
         return proc_res and not err_results
@@ -1575,16 +1643,6 @@ later is required to fix a server side protocol bug.
         if opt.prune is None:
             opt.prune = True
 
-        if opt.auto_gc is None and _AUTO_GC:
-            logger.error(
-                "Will run `git gc --auto` because %s is set. %s is deprecated "
-                "and will be removed in a future release.  Use `--auto-gc` "
-                "instead.",
-                _REPO_AUTO_GC,
-                _REPO_AUTO_GC,
-            )
-            opt.auto_gc = True
-
     def _ValidateOptionsWithManifest(self, opt, mp):
         """Like ValidateOptions, but after we've updated the manifest.
 
@@ -1628,7 +1686,7 @@ later is required to fix a server side protocol bug.
         errors = []
         try:
             self._ExecuteHelper(opt, args, errors)
-        except RepoExitError:
+        except (RepoExitError, RepoChangedException):
             raise
         except (KeyboardInterrupt, Exception) as e:
             raise RepoUnhandledExceptionError(e, aggregate_errors=errors)

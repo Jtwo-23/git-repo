@@ -21,6 +21,7 @@ import random
 import re
 import shutil
 import stat
+import string
 import subprocess
 import sys
 import tarfile
@@ -144,7 +145,7 @@ def _ProjectHooks():
     """
     global _project_hook_list
     if _project_hook_list is None:
-        d = platform_utils.realpath(os.path.abspath(os.path.dirname(__file__)))
+        d = os.path.realpath(os.path.abspath(os.path.dirname(__file__)))
         d = os.path.join(d, "hooks")
         _project_hook_list = [
             os.path.join(d, x) for x in platform_utils.listdir(d)
@@ -266,6 +267,7 @@ class ReviewableBranch:
         dest_branch=None,
         validate_certs=True,
         push_options=None,
+        patchset_description=None,
     ):
         self.project.UploadForReview(
             branch=self.name,
@@ -281,6 +283,7 @@ class ReviewableBranch:
             dest_branch=dest_branch,
             validate_certs=validate_certs,
             push_options=push_options,
+            patchset_description=patchset_description,
         )
 
     def GetPublishedRefs(self):
@@ -1089,6 +1092,7 @@ class Project:
         dest_branch=None,
         validate_certs=True,
         push_options=None,
+        patchset_description=None,
     ):
         """Uploads the named branch for code review."""
         if branch is None:
@@ -1141,8 +1145,7 @@ class Project:
         # This stops git from pushing all reachable annotated tags when
         # push.followTags is configured. Gerrit does not accept any tags
         # pushed to a CL.
-        if git_require((1, 8, 3)):
-            cmd.append("--no-follow-tags")
+        cmd.append("--no-follow-tags")
 
         for push_option in push_options or []:
             cmd.append("-o")
@@ -1171,6 +1174,10 @@ class Project:
             opts += ["wip"]
         if ready:
             opts += ["ready"]
+        if patchset_description:
+            opts += [
+                f"m={self._encode_patchset_description(patchset_description)}"
+            ]
         if opts:
             ref_spec = ref_spec + "%" + ",".join(opts)
         cmd.append(ref_spec)
@@ -1182,6 +1189,30 @@ class Project:
             self.bare_git.UpdateRef(
                 R_PUB + branch.name, R_HEADS + branch.name, message=msg
             )
+
+    @staticmethod
+    def _encode_patchset_description(original):
+        """Applies percent-encoding for strings sent as patchset description.
+
+        The encoding used is based on but stricter than URL encoding (Section
+        2.1 of RFC 3986). The only non-escaped characters are alphanumerics, and
+        'SPACE' (U+0020) can be represented as 'LOW LINE' (U+005F) or
+        'PLUS SIGN' (U+002B).
+
+        For more information, see the Gerrit docs here:
+        https://gerrit-review.googlesource.com/Documentation/user-upload.html#patch_set_description
+        """
+        SAFE = {ord(x) for x in string.ascii_letters + string.digits}
+
+        def _enc(b):
+            if b in SAFE:
+                return chr(b)
+            elif b == ord(" "):
+                return "_"
+            else:
+                return f"%{b:02x}"
+
+        return "".join(_enc(x) for x in original.encode("utf-8"))
 
     def _ExtractArchive(self, tarpath, path=None):
         """Extract the given tar on its current location
@@ -1430,8 +1461,6 @@ class Project:
         self._InitHooks()
 
     def _CopyAndLinkFiles(self):
-        if self.client.isGitcClient:
-            return
         for copyfile in self.copyfiles:
             copyfile._Copy()
         for linkfile in self.linkfiles:
@@ -1483,6 +1512,7 @@ class Project:
         self,
         syncbuf,
         force_sync=False,
+        force_checkout=False,
         submodules=False,
         errors=None,
         verbose=False,
@@ -1570,7 +1600,7 @@ class Project:
                     syncbuf.info(self, "discarding %d commits", len(lost))
 
             try:
-                self._Checkout(revid, quiet=True)
+                self._Checkout(revid, force_checkout=force_checkout, quiet=True)
                 if submodules:
                     self._SyncSubmodules(quiet=True)
             except GitError as e:
@@ -1780,11 +1810,11 @@ class Project:
                 )
             else:
                 msg = (
-                    "error: %s: Cannot remove project: uncommitted"
+                    "error: %s: Cannot remove project: uncommitted "
                     "changes are present.\n" % self.RelPath(local=False)
                 )
                 logger.error(msg)
-                raise DeleteDirtyWorktreeError(msg, project=self)
+                raise DeleteDirtyWorktreeError(msg, project=self.name)
 
         if verbose:
             print(f"{self.RelPath(local=False)}: Deleting obsolete checkout.")
@@ -1793,7 +1823,7 @@ class Project:
         # remove because it will recursively delete projects -- we handle that
         # ourselves below.  https://crbug.com/git/48
         if self.use_git_worktrees:
-            needle = platform_utils.realpath(self.gitdir)
+            needle = os.path.realpath(self.gitdir)
             # Find the git worktree commondir under .repo/worktrees/.
             output = self.bare_git.worktree("list", "--porcelain").splitlines()[
                 0
@@ -1807,7 +1837,7 @@ class Project:
                 with open(gitdir) as fp:
                     relpath = fp.read().strip()
                 # Resolve the checkout path and see if it matches this project.
-                fullpath = platform_utils.realpath(
+                fullpath = os.path.realpath(
                     os.path.join(configs, name, relpath)
                 )
                 if fullpath == needle:
@@ -2534,12 +2564,7 @@ class Project:
             branch = None
         else:
             branch = self.revisionExpr
-        if (
-            not self.manifest.IsMirror
-            and is_sha1
-            and depth
-            and git_require((1, 8, 3))
-        ):
+        if not self.manifest.IsMirror and is_sha1 and depth:
             # Shallow checkout of a specific commit, fetch from that commit and
             # not the heads only as the commit might be deeper in the history.
             spec.append(branch)
@@ -2825,10 +2850,12 @@ class Project:
         except OSError:
             return False
 
-    def _Checkout(self, rev, quiet=False):
+    def _Checkout(self, rev, force_checkout=False, quiet=False):
         cmd = ["checkout"]
         if quiet:
             cmd.append("-q")
+        if force_checkout:
+            cmd.append("-f")
         cmd.append(rev)
         cmd.append("--")
         if GitCommand(self, cmd).Wait() != 0:
@@ -2940,14 +2967,12 @@ class Project:
                             "Retrying clone after deleting %s", self.gitdir
                         )
                         try:
-                            platform_utils.rmtree(
-                                platform_utils.realpath(self.gitdir)
-                            )
+                            platform_utils.rmtree(os.path.realpath(self.gitdir))
                             if self.worktree and os.path.exists(
-                                platform_utils.realpath(self.worktree)
+                                os.path.realpath(self.worktree)
                             ):
                                 platform_utils.rmtree(
-                                    platform_utils.realpath(self.worktree)
+                                    os.path.realpath(self.worktree)
                                 )
                             return self._InitGitDir(
                                 mirror_git=mirror_git,
@@ -3033,7 +3058,7 @@ class Project:
             self._InitHooks(quiet=quiet)
 
     def _InitHooks(self, quiet=False):
-        hooks = platform_utils.realpath(os.path.join(self.objdir, "hooks"))
+        hooks = os.path.realpath(os.path.join(self.objdir, "hooks"))
         if not os.path.exists(hooks):
             os.makedirs(hooks)
 
@@ -3176,9 +3201,9 @@ class Project:
             dst_path = os.path.join(destdir, name)
             src_path = os.path.join(srcdir, name)
 
-            dst = platform_utils.realpath(dst_path)
+            dst = os.path.realpath(dst_path)
             if os.path.lexists(dst):
-                src = platform_utils.realpath(src_path)
+                src = os.path.realpath(src_path)
                 # Fail if the links are pointing to the wrong place.
                 if src != dst:
                     logger.error(
@@ -3214,10 +3239,10 @@ class Project:
         if copy_all:
             to_copy = platform_utils.listdir(gitdir)
 
-        dotgit = platform_utils.realpath(dotgit)
+        dotgit = os.path.realpath(dotgit)
         for name in set(to_copy).union(to_symlink):
             try:
-                src = platform_utils.realpath(os.path.join(gitdir, name))
+                src = os.path.realpath(os.path.join(gitdir, name))
                 dst = os.path.join(dotgit, name)
 
                 if os.path.lexists(dst):
@@ -3306,7 +3331,7 @@ class Project:
         if not platform_utils.islink(dotgit) and platform_utils.isdir(dotgit):
             self._MigrateOldWorkTreeGitDir(dotgit, project=self.name)
 
-        init_dotgit = not os.path.exists(dotgit)
+        init_dotgit = not os.path.lexists(dotgit)
         if self.use_git_worktrees:
             if init_dotgit:
                 self._InitGitWorktree()
@@ -3314,9 +3339,7 @@ class Project:
         else:
             if not init_dotgit:
                 # See if the project has changed.
-                if platform_utils.realpath(
-                    self.gitdir
-                ) != platform_utils.realpath(dotgit):
+                if os.path.realpath(self.gitdir) != os.path.realpath(dotgit):
                     platform_utils.remove(dotgit)
 
             if init_dotgit or not os.path.exists(dotgit):
